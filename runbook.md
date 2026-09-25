@@ -36,8 +36,9 @@ Directory: `~/bw/sts/` — `postgres/`, `polaris/`, `jupyter/`, each with its ow
 in the VAST VMS UI/CLI, `[HOST]` = shell/docker on this host, `[NOTEBOOK]` =
 inside a Jupyter notebook cell.
 
-See `~/.claude/plans/i-need-some-devops-zany-sphinx.md` for the full design
-rationale (why STS AssumeRole, why Postgres, why table-scoped grants).
+See [README.md's "Appendix: Design rationale"](README.md#appendix-design-rationale)
+for the full design rationale (why STS AssumeRole, why Postgres, why
+table-scoped grants).
 
 ## 0. Prerequisites — cluster-specific values
 
