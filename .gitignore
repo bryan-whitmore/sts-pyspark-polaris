@@ -1,0 +1,15 @@
+# Real lab endpoints, bucket names, and role ARN for this cluster.
+# See .env.example for the tracked template.
+polaris/.env
+
+# Secrets: Postgres password, Polaris root client secret, VAST access keys.
+polaris/.env.secrets
+postgres/.env.secrets
+
+# Real leaf cert fetched from the VAST STS endpoint (see runbook.md
+# Prerequisites / step 6 bug 2 for how to regenerate).
+polaris/docker/vast-sts.pem
+
+# Generated/manual per-principal Polaris + VASTDB credentials and the
+# shared VASTDB endpoint list.
+jupyter/creds/*.env

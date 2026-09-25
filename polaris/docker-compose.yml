@@ -1,0 +1,102 @@
+networks:
+  sts_net:
+    external: true
+
+services:
+
+  # One-shot: creates the polaris_schema in Postgres + the realm's root
+  # principal. Must succeed before `polaris` starts (relational-jdbc
+  # backend requires the schema to already exist).
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:${POLARIS_VERSION:-1.7.0}
+    env_file:
+      - .env
+      - .env.secrets
+    environment:
+      QUARKUS_CONFIG_LOCATIONS: /config/application.properties
+    networks:
+      - sts_net
+    volumes:
+      - ./config/application.properties:/config/application.properties:ro
+    command: ["bootstrap", "-r", "${POLARIS_REALM:-polaris_demo}", "-c", "${POLARIS_REALM:-polaris_demo},${ROOT_CLIENT_ID:-root},${ROOT_CLIENT_SECRET:-s3cr3t}"]
+
+  polaris:
+    build:
+      context: docker/
+      args:
+        POLARIS_VERSION: ${POLARIS_VERSION:-1.7.0}
+    container_name: sts-polaris
+    depends_on:
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+      - .env.secrets
+    environment:
+      QUARKUS_CONFIG_LOCATIONS: /config/application.properties
+    networks:
+      - sts_net
+    # VAST's TLS cert on the STS port has no SAN for the CNode VIP itself
+    # (VAST_STS_IP in .env) — only *.vastdata.com / vms.vastdata.com / other IPs.
+    # Trusting the cert (see docker/Dockerfile) fixes chain validation, but
+    # the AWS SDK's Apache HTTP client still separately checks hostname vs.
+    # SAN. This local-only /etc/hosts entry gives Polaris a hostname that
+    # matches the *.vastdata.com wildcard while still resolving to the real
+    # VIP, satisfying that check without touching the VAST cluster or
+    # patching Polaris (which has no config flag for this — see runbook.md).
+    extra_hosts:
+      - "sts.vastdata.com:${VAST_STS_IP}"
+    ports:
+      - "8181:8181"  # Iceberg REST + management API
+      - "8182:8182"  # metrics / health
+      - "5005:5005"  # optional JVM debugger
+    volumes:
+      - ./config/application.properties:/config/application.properties:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
+  # One-shot: creates the VASTDB schema + tables (shipments, reviews,
+  # inventory_events) that the Generic Table registrations below point at.
+  # Uses the admin (var203/AllowAllTabular) identity — Alice/Bob's own
+  # VASTDB access happens through separate, narrowly-scoped keys created
+  # manually in VMS (see runbook.md), NOT this one.
+  vastdb-setup:
+    build:
+      context: config/vastdb_setup/
+    env_file:
+      - .env
+      - .env.secrets
+    networks:
+      - sts_net
+
+  # One-shot: creates the catalog (STS AssumeRole storage config), the
+  # `demo` namespace + tables + alice/bob principals + table-scoped grants
+  # (Iceberg), and the `vastdb_demo` namespace + Generic Table registrations
+  # + grants (VASTDB metadata only — see runbook.md's VASTDB extension
+  # section). Writes their Polaris client credentials into
+  # ../jupyter/creds/*.env.
+  polaris-setup:
+    image: alpine/curl:8.21.0
+    depends_on:
+      polaris:
+        condition: service_healthy
+      vastdb-setup:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+      - .env.secrets
+    networks:
+      - sts_net
+    volumes:
+      - ./config/setup.sh:/setup.sh:ro
+      - ../jupyter/creds:/creds
+    entrypoint: ["/bin/sh", "/setup.sh"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/polaris-setup-done"]
+      interval: 1s
+      timeout: 10s
+      retries: 240

@@ -1,0 +1,21 @@
+networks:
+  sts_net:
+    external: true
+
+services:
+  jupyter:
+    build:
+      context: docker/
+    container_name: sts-jupyter
+    restart: unless-stopped
+    networks:
+      - sts_net
+    ports:
+      - "8888:8888"  # Jupyter
+      - "4040:4040"  # Spark UI (Alice's session, if run first)
+      - "4041:4041"  # Spark UI (Bob's session, if run second)
+    environment:
+      JUPYTER_TOKEN: "sts-demo"
+    volumes:
+      - ./notebooks:/home/jovyan/notebooks:rw
+      - ./creds:/home/jovyan/creds:ro
