@@ -46,13 +46,15 @@ in per [runbook.md § 0 Prerequisites](runbook.md#0-prerequisites--cluster-speci
 | `polaris/.env` | [polaris/.env.example](polaris/.env.example) | Bucket, prefix, S3 + STS endpoints, STS VIP, role ARN, catalog/realm names |
 | `polaris/.env.secrets` | [polaris/.env.secrets.example](polaris/.env.secrets.example) | Postgres password, Polaris root client secret, the permanent VAST key that signs `AssumeRole` |
 | `postgres/.env.secrets` | [postgres/.env.secrets.example](postgres/.env.secrets.example) | Same Postgres credentials, for the DB side |
-| `jupyter/creds/vastdb_endpoint.env` | [jupyter/creds/vastdb_endpoint.env.example](jupyter/creds/vastdb_endpoint.env.example) | VAST DB endpoint list for the `ndb` catalog |
+| `polaris/.env` → `VASTDB_DATA_ENDPOINTS` | [polaris/.env.example](polaris/.env.example) | CNode VIP list; `setup.sh` copies it into each Generic Table, and the notebooks read it back from the catalog |
 | `jupyter/creds/{alice,bob}_db.env` | [alice_db.env.example](jupyter/creds/alice_db.env.example), [bob_db.env.example](jupyter/creds/bob_db.env.example) | Per-principal, narrowly scoped VASTDB access keys created by hand in VMS |
 | `polaris/docker/vast-sts.pem` | — (fetch with `openssl s_client`, see [runbook.md § 6](runbook.md#6-host-start-polaris-bootstrap--server--catalogprincipal-setup)) | VAST's STS leaf cert, baked into the Polaris image's Java truststore |
 
 `jupyter/creds/{alice,bob}.env` are not templates to fill in — the
-`polaris-setup` sidecar writes each principal's Polaris client ID and secret
-there as it creates them.
+`polaris-setup` sidecar writes each principal's Polaris client ID, secret,
+catalog name and realm there as it creates them. The realm is included
+because the notebooks call the Generic Tables REST API directly, and that
+call needs a `Polaris-Realm` header.
 
 The rest is tracked and should not need editing per cluster:
 

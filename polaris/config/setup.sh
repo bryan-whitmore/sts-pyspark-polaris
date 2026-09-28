@@ -95,12 +95,18 @@ curl --fail-with-body -s -S -X POST "http://polaris:8181/api/catalog/v1/${CATALO
 echo "Namespace created"
 
 # create_generic_table <name>
+#
+# The `vastdb.*` properties are what the notebooks read back to address the
+# table through the `ndb` catalog, so that bucket/schema/endpoint appear in
+# exactly one place (here) rather than being hardcoded in each notebook.
+# vastdb.data_endpoints is the multi-VIP list for spark.ndb.data_endpoints —
+# no VAST DB property is standard for this, these names are ours.
 create_generic_table() {
   tname="$1"
   curl --fail-with-body -s -S -X POST "http://polaris:8181/api/catalog/polaris/v1/${CATALOG_NAME}/namespaces/vastdb_demo/generic-tables" \
     -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
     -H "Polaris-Realm: ${REALM}" \
-    -d "{\"name\": \"${tname}\", \"format\": \"vastdb\", \"base-location\": \"vastdb://${VAST_BUCKET}/${VASTDB_SCHEMA}/${tname}\", \"doc\": \"Read/written via the VAST DB Spark connector, not Polaris-vended\", \"properties\": {\"vastdb.bucket\": \"${VAST_BUCKET}\", \"vastdb.schema\": \"${VASTDB_SCHEMA}\", \"vastdb.table\": \"${tname}\", \"vastdb.endpoint\": \"${VAST_S3_ENDPOINT}\"}}" \
+    -d "{\"name\": \"${tname}\", \"format\": \"vastdb\", \"base-location\": \"vastdb://${VAST_BUCKET}/${VASTDB_SCHEMA}/${tname}\", \"doc\": \"Read/written via the VAST DB Spark connector, not Polaris-vended\", \"properties\": {\"vastdb.bucket\": \"${VAST_BUCKET}\", \"vastdb.schema\": \"${VASTDB_SCHEMA}\", \"vastdb.table\": \"${tname}\", \"vastdb.endpoint\": \"${VAST_S3_ENDPOINT}\", \"vastdb.data_endpoints\": \"${VASTDB_DATA_ENDPOINTS}\"}}" \
     || fail "Failed to create generic table vastdb_demo.${tname}"
 }
 
@@ -236,16 +242,22 @@ grant_catalog_wide alice_catalog_role TABLE_LIST
 grant_catalog_wide bob_catalog_role NAMESPACE_LIST
 grant_catalog_wide bob_catalog_role TABLE_LIST
 
+# POLARIS_REALM is included because the notebooks call the Generic Tables
+# REST API directly (Spark's Iceberg catalog doesn't cover it) and that
+# call needs the Polaris-Realm header — without this the notebook would
+# have to hardcode the realm name.
 mkdir -p /creds
 cat > /creds/alice.env <<EOF
 POLARIS_CLIENT_ID=${ALICE_ID}
 POLARIS_CLIENT_SECRET=${ALICE_SECRET}
 POLARIS_CATALOG_NAME=${CATALOG_NAME}
+POLARIS_REALM=${REALM}
 EOF
 cat > /creds/bob.env <<EOF
 POLARIS_CLIENT_ID=${BOB_ID}
 POLARIS_CLIENT_SECRET=${BOB_SECRET}
 POLARIS_CATALOG_NAME=${CATALOG_NAME}
+POLARIS_REALM=${REALM}
 EOF
 
 echo ""

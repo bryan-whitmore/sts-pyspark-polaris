@@ -31,6 +31,19 @@ Polaris bootstrap/catalog/grants, the STS AssumeRole path, and the
 `ndb` catalog's real endpoint connectivity) re-validated clean against the
 real cluster.
 
+**Update (2026-09-28):** the notebooks' VASTDB cells now discover tables
+through Polaris's Generic Tables API instead of hardcoding
+bucket/schema/endpoints — see step 6b. Verified against the live cluster:
+the two REST endpoints, the per-principal 403 matrix, the
+`vastdb.data_endpoints` property round-tripping, and both notebooks'
+discovery cells run verbatim in the Jupyter container as `alice` and
+`bob`. **Not yet re-run: the Spark cells themselves** (cells 3-11), so the
+rewritten `ndb()` call sites are syntax-checked and their identifiers
+verified by hand, not executed. Run both notebooks top to bottom before
+trusting steps 8-9. `polaris-setup` has not been re-run either, so the
+live registrations still lack `vastdb.data_endpoints` and the notebooks
+print `1 data endpoint(s)` from the fallback until it is.
+
 Directory: `~/bw/sts/` — `postgres/`, `polaris/`, `jupyter/`, each with its own
 `docker-compose.yml`. Run them in the order below. Tags: `[VMS]` = manual step
 in the VAST VMS UI/CLI, `[HOST]` = shell/docker on this host, `[NOTEBOOK]` =
@@ -52,7 +65,7 @@ template to copy. Fill these in before step 1:
 | S3 data-plane endpoint | `http://172.200.203.1` | `polaris/.env` → `VAST_S3_ENDPOINT` |
 | STS endpoint (hostname + VIP) | `https://sts.vastdata.com:443` → `172.200.203.1` | `polaris/.env` → `VAST_STS_ENDPOINT` / `VAST_STS_IP` |
 | AIM Role ARN | `arn:vast:iam::default:role/test` | `polaris/.env` → `VAST_ROLE_ARN` |
-| VAST DB (ndb) endpoint(s) | `172.200.203.1`–`.6` | `jupyter/creds/vastdb_endpoint.env` |
+| VAST DB (ndb) endpoint(s) | `172.200.203.1`–`.6` | `polaris/.env` → `VASTDB_DATA_ENDPOINTS` (step 6 copies these into each Generic Table's properties; the notebooks read them back from Polaris rather than from a file of their own) |
 | Postgres password | — | `postgres/.env.secrets` + `polaris/.env.secrets` (must match) |
 | Polaris root client secret | — | `polaris/.env.secrets` → `ROOT_CLIENT_ID`/`ROOT_CLIENT_SECRET` |
 | Admin VAST access key (var203/AllowAllTabular) | — | `polaris/.env.secrets` → `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` |
@@ -329,9 +342,35 @@ behavior of those two endpoints as `alice`/`bob` (2026-09-28):
 So the per-table `TABLE_FULL_METADATA` grants *are* load-bearing — the
 403s name `op LOAD_TABLE` — while listing is catalog-wide `TABLE_LIST` and
 leaks table names only, exactly the same tradeoff as the Iceberg side in
-step 6. A load returns `storage-access-configs: []` plus all four
+step 6. A load returns `storage-access-configs: []` plus all five
 `vastdb.*` properties, which is enough to build the `ndb` identifier
 without hardcoding bucket or schema anywhere in the notebook.
+
+**This is what the notebooks now do.** Both call these two endpoints in
+the cell before the `SparkSession` is built — before, because the session
+needs `spark.ndb.endpoint` / `data_endpoints`, which come from the
+registration. The cell produces:
+
+- `registered` — `{name: properties}` for every table the principal can
+  load, and an `ndb(name)` helper that builds the fully-qualified
+  identifier from `vastdb.bucket`/`vastdb.schema`/`vastdb.table`;
+- `denied` — names Polaris listed but refused to load, used by the last
+  cell's pass/fail check;
+- `DB`, `VASTDB_ENDPOINT`, `VASTDB_DATA_ENDPOINTS`, read off the first
+  loadable registration.
+
+Nothing about the VAST DB layout is written in the notebooks any more, and
+a registration that drifts from reality now fails visibly instead of being
+silently overridden by a hardcoded value. `vastdb.data_endpoints` is our
+own property name, not a VAST DB convention; registrations made before it
+was added fall back to the single control endpoint, so the notebook prints
+`1 data endpoint(s)` until `polaris-setup` is re-run.
+
+The final VASTDB cell checks *both* layers refusing the same table: the
+name appearing in `denied` is Polaris enforcing the grant, and the write
+attempt that follows is VAST enforcing the Identity Policy. The identifier
+for that write has to be built by hand, since `ndb()` can only produce
+identifiers for tables Polaris was willing to describe.
 
 **`[VMS]` Create two new VAST Users with scoped Identity Policies:**
 
@@ -505,11 +544,17 @@ top to bottom. Confirms:
   *and* the `ndb` VASTDB catalog with alice-db's static key, in one session.
 - Alice can create/read/write `demo.customers`, `demo.orders`,
   `demo.order_items` (Iceberg, Polaris-vended).
+- The discovery cell lists all three Generic Tables but loads only
+  `shipments` and `inventory_events`, printing `reviews` under
+  `metadata denied (403)` — see step 6b for the full matrix.
 - Alice can read/write VASTDB `shipments` and `inventory_events` via the
-  `ndb` catalog (static key, VAST-enforced, not Polaris).
+  `ndb` catalog (static key, VAST-enforced, not Polaris), addressed by
+  identifiers built from the registration rather than hardcoded.
 - The write to `demo.products` is **rejected** by Polaris (prints `PASS`).
-- The write to VASTDB `reviews` is **rejected** by VAST directly (prints
-  `PASS`) — a different enforcement layer than the Iceberg check above.
+- The write to VASTDB `reviews` is **rejected twice over** (prints two
+  `PASS` lines): Polaris refused its metadata in the discovery cell, and
+  VAST refuses the write itself — two independent enforcement layers,
+  neither of them the Iceberg check above.
 
 ## 9. `[NOTEBOOK]` Run `Bob.ipynb`
 
@@ -520,7 +565,7 @@ Same, for Bob. Confirms:
   from step 8 alongside Bob's own — proof of the intentional overlap on
   *both* the Iceberg and VASTDB sides.
 - The writes to `demo.customers` (Iceberg) and VASTDB `shipments` are both
-  **rejected** (prints `PASS` for each).
+  **rejected** (prints `PASS` for each; `shipments` twice, once per layer).
 - Re-run Alice's `order_items`/`inventory_events` cells afterward to see
   Bob's rows too.
 
