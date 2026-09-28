@@ -183,6 +183,15 @@ as **Generic Tables**, which carry catalog metadata and grants but return
 correct model here, not a limitation to work around: the connector authenticates
 to VASTDB directly.
 
+Generic Tables are a distinct entity subtype, not Iceberg tables with a
+different location, so they are reached through their own list and load
+endpoints rather than `SHOW TABLES` — see
+[runbook.md § 6b](runbook.md#6b-vastdb-extension--whitmore-is-also-a-vast-database)
+for the measured per-principal behavior of those endpoints. Loading one is
+gated by that principal's `TABLE_FULL_METADATA` grant and returns the
+`vastdb.*` properties needed to address the table through `ndb`; listing is
+catalog-wide and leaks names only.
+
 The consequence is that Alice and Bob each need their own narrowly scoped VASTDB
 access key, created by hand in VMS, with an Identity Policy that goes beyond the
 documented example — plain `s3:ListBucket`, the schema-object-itself resource

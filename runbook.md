@@ -298,9 +298,40 @@ trusting the spec/docs. `setup.sh` uses this path now.
 
 So the design here is: Polaris gives unified **catalog discovery**
 (`vastdb_demo` namespace, Generic Tables `shipments`/`reviews`/
-`inventory_events`, browsable via `SHOW TABLES` same as the Iceberg ones),
-but **actual read/write authorization is enforced by VAST directly**, via
-two new, separate, narrowly-scoped VAST access keys — not by Polaris.
+`inventory_events`), but **actual read/write authorization is enforced by
+VAST directly**, via two new, separate, narrowly-scoped VAST access keys —
+not by Polaris.
+
+Discovery here does *not* mean `SHOW TABLES`. Generic Tables are a
+different entity subtype from Iceberg tables (confirmed in
+`polaris_schema.entities`: both `type_code` 7, but `sub_type_code` 4 for
+generic vs 2 for Iceberg), and the Iceberg REST `listTables` endpoint
+returns only the Iceberg subtype. Generic Tables have their own
+list/load endpoints, which the `/api/catalog/v1/config` `endpoints` list
+confirms:
+
+```
+GET polaris/v1/{prefix}/namespaces/{namespace}/generic-tables
+GET polaris/v1/{prefix}/namespaces/{namespace}/generic-tables/{generic-table}
+```
+
+Reaching them from a notebook is an HTTP call, not a Spark catalog
+operation — Iceberg's `SparkCatalog` speaks only the Iceberg endpoints,
+and would try to load a `vastdb://` location as Iceberg anyway. Measured
+behavior of those two endpoints as `alice`/`bob` (2026-09-28):
+
+| | `shipments` | `reviews` | `inventory_events` |
+|---|---|---|---|
+| list (both principals) | visible | visible | visible |
+| load as `alice` | 200 | **403** | 200 |
+| load as `bob` | **403** | 200 | 200 |
+
+So the per-table `TABLE_FULL_METADATA` grants *are* load-bearing — the
+403s name `op LOAD_TABLE` — while listing is catalog-wide `TABLE_LIST` and
+leaks table names only, exactly the same tradeoff as the Iceberg side in
+step 6. A load returns `storage-access-configs: []` plus all four
+`vastdb.*` properties, which is enough to build the `ndb` identifier
+without hardcoding bucket or schema anywhere in the notebook.
 
 **`[VMS]` Create two new VAST Users with scoped Identity Policies:**
 
@@ -522,3 +553,17 @@ docker network rm sts_net
   time) — if VAST ever rotates this cert, `docker compose build polaris`
   needs to be rerun after re-fetching it via the `openssl s_client` command
   in step 6's writeup above.
+- All three long-lived services set `restart: unless-stopped`, so anything
+  that bounces the docker daemon brings them all back. **Expect noisy
+  Polaris logs for the first few seconds after such a restart:** restart
+  policies do not honor `depends_on`, so Polaris can start before Postgres
+  is accepting connections and will log JDBC connection failures until it
+  is. Docker retries with backoff and it self-heals — no action needed
+  unless the container is still restarting after a minute or so, which
+  would mean Postgres itself failed to come back. Check
+  `docker logs sts-postgres` before touching Polaris.
+
+  The one-shot sidecars (`polaris-bootstrap`, `vastdb-setup`,
+  `polaris-setup`) deliberately have no restart policy — re-running
+  `polaris-setup` would rewrite `jupyter/creds/*.env` on every daemon
+  bounce.

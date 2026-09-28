@@ -26,6 +26,17 @@ services:
       args:
         POLARIS_VERSION: ${POLARIS_VERSION:-1.7.0}
     container_name: sts-polaris
+    # Matches postgres/ and jupyter/, which both set this. Without it,
+    # anything that bounces the docker daemon (a docker-ce package upgrade,
+    # say) leaves Polaris down while its own Postgres and the Jupyter
+    # server come back — notebooks then open fine and every `polaris`
+    # catalog call fails while `ndb` calls keep working.
+    #
+    # Restart policies do NOT honor depends_on, so on a daemon restart
+    # Polaris can come up before Postgres is healthy and fail its first
+    # JDBC connection. That is expected and self-healing: docker retries
+    # with backoff until Postgres answers. See runbook.md's open items.
+    restart: unless-stopped
     depends_on:
       polaris-bootstrap:
         condition: service_completed_successfully
