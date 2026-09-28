@@ -33,16 +33,24 @@ real cluster.
 
 **Update (2026-09-28):** the notebooks' VASTDB cells now discover tables
 through Polaris's Generic Tables API instead of hardcoding
-bucket/schema/endpoints — see step 6b. Verified against the live cluster:
-the two REST endpoints, the per-principal 403 matrix, the
-`vastdb.data_endpoints` property round-tripping, and both notebooks'
-discovery cells run verbatim in the Jupyter container as `alice` and
-`bob`. **Not yet re-run: the Spark cells themselves** (cells 3-11), so the
-rewritten `ndb()` call sites are syntax-checked and their identifiers
-verified by hand, not executed. Run both notebooks top to bottom before
-trusting steps 8-9. `polaris-setup` has not been re-run either, so the
-live registrations still lack `vastdb.data_endpoints` and the notebooks
-print `1 data endpoint(s)` from the fallback until it is.
+bucket/schema/endpoints — see step 6b. All three services also now set
+`restart: unless-stopped`; Polaris previously did not, so a docker daemon
+upgrade left it down while Postgres and Jupyter came back.
+
+Rebuilt from scratch on this date (full `down -v` on `polaris/` and
+`postgres/`, re-bootstrap, re-run) and re-validated: bootstrap, catalog +
+STS storage config, all five Iceberg tables, all three Generic Tables now
+carrying `vastdb.data_endpoints` with six VIPs, principals and grants. Both
+notebooks' discovery cells run clean in the Jupyter container, each
+resolving exactly its two granted tables with the third denied 403.
+
+**Not re-run: the Spark cells themselves** (cells 3-11). The rewritten
+`ndb()` call sites are syntax-checked and their identifiers verified by
+hand, not executed — run both notebooks top to bottom before trusting
+steps 8-9. Note also that the rebuild wrote fresh Iceberg metadata over an
+S3 prefix that already held data, so `demo.*` tables read empty and the
+previous rows are orphaned; the VASTDB tables kept their rows, since
+`vastdb-setup` skips tables that already exist.
 
 Directory: `~/bw/sts/` — `postgres/`, `polaris/`, `jupyter/`, each with its own
 `docker-compose.yml`. Run them in the order below. Tags: `[VMS]` = manual step
