@@ -44,13 +44,27 @@ carrying `vastdb.data_endpoints` with six VIPs, principals and grants. Both
 notebooks' discovery cells run clean in the Jupyter container, each
 resolving exactly its two granted tables with the third denied 403.
 
-**Not re-run: the Spark cells themselves** (cells 3-11). The rewritten
-`ndb()` call sites are syntax-checked and their identifiers verified by
-hand, not executed — run both notebooks top to bottom before trusting
-steps 8-9. Note also that the rebuild wrote fresh Iceberg metadata over an
-S3 prefix that already held data, so `demo.*` tables read empty and the
-previous rows are orphaned; the VASTDB tables kept their rows, since
-`vastdb-setup` skips tables that already exist.
+**Update (2026-10-01):** both notebooks re-validated top to bottom
+against the live cluster, including the Spark cells (3-11) that the
+2026-09-28 pass had only syntax-checked. All 12 cells of each run clean:
+the vended-credentials Iceberg path, the `ndb` VASTDB path, both overlaps
+(`demo.order_items` and `vastdb_demo.inventory_events` each showing the
+other principal's row), and all three expected-fail gates per notebook.
+`demo.*` tables hold rows again — the 2026-09-28 note about them reading
+empty over orphaned data is superseded by these runs.
+
+Insert idempotency re-confirmed by running `Bob.ipynb` twice: each run
+added exactly its own rows (`reviews` 10→12, `inventory_events` and
+`order_items` +1 each), so `spark.task.maxFailures=1` is still
+suppressing the bug-10 duplicate-retry path. Rows do accumulate across
+runs by design — reset the VASTDB tables if a demo needs clean counts.
+
+Three operational gotchas this pass surfaced, all written up at step 8:
+dead catalog tokens in long-open notebooks (a restart of the `polaris`
+stack kills every open session, and only a kernel restart recovers — a
+re-run of cell 3 cannot), the `PYTHONPATH` prerequisite for headless runs,
+and a false-PASS hole in the expected-fail cells — the last of these now
+fixed in both notebooks, the other two documented.
 
 Directory: `~/bw/sts/` — `postgres/`, `polaris/`, `jupyter/`, each with its own
 `docker-compose.yml`. Run them in the order below. Tags: `[VMS]` = manual step
@@ -563,6 +577,119 @@ top to bottom. Confirms:
   `PASS` lines): Polaris refused its metadata in the discovery cell, and
   VAST refuses the write itself — two independent enforcement layers,
   neither of them the Iceberg check above.
+
+VAST's refusal of that write surfaces as Spark
+`AnalysisException: TABLE_OR_VIEW_NOT_FOUND`, not a permission error: the
+connector 403s on `LIST_COLUMNS` while resolving the table (visible in the
+`VastClient` log line above it) and reports the unresolvable name instead.
+A denial, not a missing table.
+
+**A notebook session whose token has gone dead needs a kernel restart — a
+re-run will not do it.** Polaris issues 1-hour tokens (no token-broker
+config here, so the Quarkus default; measurable as `iat`→`exp` on the JWT
+from `/v1/oauth/tokens`). The hour is not by itself a ceiling: Iceberg
+refreshes the token in a background thread, measured on 2026-10-01 to
+carry a session cleanly through t=60min and t=70min. What kills a session
+is that refresh chain breaking — see the two causes below. Once it is
+broken, every `polaris` catalog call in that session 401s — and Polaris
+returns 401 with a **zero-byte body**, so
+Iceberg's `ErrorHandlers` logs `Unable to parse error response` /
+`No content to map due to end-of-input ... at [Source: (String)""]`
+before the real `SHOW NAMESPACES` failure. That WARN is a symptom of an
+expired session, not a parse bug to chase.
+
+Re-running cell 3 does **not** fix it:
+`SparkSession.builder...getOrCreate()` returns the *existing* session, and
+its Iceberg catalog object was already built around the now-dead auth
+session, so the fresh `credential` passed to the builder is ignored. Cell
+3 appears to succeed and the next catalog call fails identically.
+
+**Stop and restart the kernel**, then run cells 1-3, so that cell 1
+fetches a new token and `getOrCreate` has no live session to hand back.
+(Confirmed live on 2026-10-01: a kernel restart cleared the failure on the
+stale session below. `spark.stop()` before re-running cell 3 is the same
+fix without losing the kernel's other state.)
+
+Diagnose it without guessing — the Spark UI reports the session's age, and
+anything over an hour explains itself:
+
+```bash
+curl -s http://localhost:4040/api/v1/applications | jq '.[].attempts[].startTime'
+```
+
+(Hit live on 2026-10-01: an `alice-sts-demo` session started
+2026-09-28T15:52 was still bound to port 4040 and had been failing every
+Polaris call for three days, while fresh runs against the same cluster
+passed.) The `ndb`/VASTDB cells keep working in such a session — that key
+is static and never expires — so a half-dead notebook where only the
+Iceberg cells fail is this, not a VASTDB problem.
+
+Two things break the refresh chain, and the first is the one that actually
+bit on 2026-09-28:
+
+1. **Restarting or rebuilding Polaris under a live notebook.** The dead
+   session above started at 15:52:29; `sts-polaris` reports
+   `StartedAt 16:00:18` the same day with `RestartCount 0` — recreated by
+   hand eight minutes into that session, as part of this file's
+   2026-09-28 rebuild. A token cannot be refreshed against a Polaris that
+   no longer recognizes it, and a `down -v` rebuild also re-bootstraps the
+   realm, so every notebook open at the time is dead with no way back.
+   **Restart the kernels of any open notebook after touching the
+   `polaris/` or `postgres/` stacks.** (The timing and mechanism line up;
+   whether the signing keys specifically are regenerated per boot was not
+   separately tested.)
+2. **A long-idle session**, if the refresh thread stops or its scheduled
+   refresh lapses. Not reproduced in isolation — the 70-minute probe above
+   kept its session alive, but that probe never had Polaris pulled out
+   from under it, and its refresh thread runs whether or not cells are
+   being executed, so it does not separate "idle" from "active."
+
+So the expiry window alone is not a reason to restart a kernel mid-demo.
+A Polaris restart is.
+
+**Running these headless** (`jupyter nbconvert --execute`, for a scripted
+re-validation rather than the browser): `pyspark` is only on `PYTHONPATH`
+because the server process sourced
+`before-notebook.d/10spark-config.sh` at container startup — a plain
+`docker exec` shell has none of it, and cell 3 dies with
+`ModuleNotFoundError: No module named 'pyspark'`. Source the hook first:
+
+```bash
+docker exec sts-jupyter bash -lc \
+  'source /usr/local/bin/before-notebook.d/10spark-config.sh
+   cd /home/jovyan/notebooks && jupyter nbconvert --to notebook --execute \
+     --ExecutePreprocessor.timeout=1200 --output-dir=/tmp/revalidate \
+     --output Alice.out.ipynb Alice.ipynb'
+```
+
+**The expected-fail cells verify *why* the write failed, not just that it
+did.** They used to wrap the forbidden write in `except Exception`, which
+caught any failure at all — a session that never built still printed
+`PASS: write to demo.products correctly rejected`, and cell 11 printed
+both its `PASS` lines, off a bare `NameError: name 'spark' is not
+defined`. Seen live during the 2026-10-01 pass, from the missing-
+`PYTHONPATH` failure above; an expired token (above that) fakes a PASS the
+same way. A gate that passes while the demo is broken is worse than no
+gate.
+
+Both cells now catch only `(Py4JJavaError, AnalysisException)` and
+re-`raise` unless the message carries the markers of a real refusal —
+`ForbiddenException` plus `not authorized for op` on the Iceberg side, and
+on the VASTDB side the forbidden table's name plus one of
+`TABLE_OR_VIEW_NOT_FOUND` / `AccessDenied` / `Forbidden` / `not allowed` /
+`403`. Anything else fails the cell loudly. Verified both directions on
+2026-10-01: all four gates still `PASS` against live denials, and with
+`pyspark` off the path the cells raise instead of printing `PASS`.
+
+Keep the markers in step with reality — they are matched against exception
+*text*, so a Polaris or connector upgrade that rewords a denial turns a
+real PASS into a raised cell. That is the intended failure direction
+(loud, not silent), but it is a thing to re-check after an upgrade.
+
+Cell 11's first line, `PASS (Polaris)`, legitimately still prints in a
+broken session: it asserts against `denied` from the pure-HTTP discovery
+cell, which needs no Spark. Only its second, `PASS (VAST)`, depends on the
+session.
 
 ## 9. `[NOTEBOOK]` Run `Bob.ipynb`
 
