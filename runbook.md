@@ -1,75 +1,24 @@
 # Polaris + STS AssumeRole Alice/Bob Demo — Runbook
 
-**Status (2026-09-22):** The Iceberg/STS core (steps 1-9, minus 6b) is
-validated end-to-end against the real `whitmore` bucket on var203,
-including both notebooks and both expected-fail isolation checks. Four
-real bugs were found and fixed along the way (documented inline at step 2
-and step 6) — re-read those before changing storage config, grants, or the
-Polaris image.
+**Validated end to end on 2026-10-22** against `selab-var-203`
+(VAST 5.4.6.0, `main` VIPs `172.200.203.1`–`.6`): the VAST-side identities,
+the Polaris bootstrap/catalog/grants, the STS AssumeRole path with
+prefix-scoped vended credentials, the `ndb` VASTDB path, both overlaps, and
+every expected-fail gate in both notebooks.
 
-**VASTDB extension: fully validated end-to-end, including both notebooks
-(2026-09-22).** VASTDB schema/tables created, all three registered as
-Generic Tables (confirmed `storage-access-configs: []`, genuinely no
-credential vending, as expected). The Jupyter image's engineering side
-needed five real bugs fixed getting the `ndb` catalog to load and behave
-reasonably (wrong Scala version, extraClassPath timing, jar classpath
-order, two conflicting bundled jars, and noisy default logging — see
-step 7). The Identity Policy needed **four** iterative fixes beyond the
-docs' example (missing plain `s3:ListBucket`, schema-object-itself
-resource form, `TabularGetTableStats`, `TabularListColumns` — see step
-6b) — each found fastest by testing the raw `vastdb` SDK directly against
-VAST rather than rebuilding notebooks each time. Both `Alice.ipynb` and
-`Bob.ipynb` now run correctly end-to-end, Iceberg and VASTDB cells alike,
-confirmed by the user.
-
-**Update (2026-09-22):** a from-scratch re-verification pass (full
-`docker compose down -v` across all three stacks, re-bootstrap, re-run)
-surfaced one more real bug — `spark.task.maxFailures` bug 10 in step 7 —
-found because scripted headless re-runs hit task retries that interactive
-notebook use hadn't. Fixed in both notebooks. Everything else (Postgres,
-Polaris bootstrap/catalog/grants, the STS AssumeRole path, and the
-`ndb` catalog's real endpoint connectivity) re-validated clean against the
-real cluster.
-
-**Update (2026-09-28):** the notebooks' VASTDB cells now discover tables
-through Polaris's Generic Tables API instead of hardcoding
-bucket/schema/endpoints — see step 6b. All three services also now set
-`restart: unless-stopped`; Polaris previously did not, so a docker daemon
-upgrade left it down while Postgres and Jupyter came back.
-
-Rebuilt from scratch on this date (full `down -v` on `polaris/` and
-`postgres/`, re-bootstrap, re-run) and re-validated: bootstrap, catalog +
-STS storage config, all five Iceberg tables, all three Generic Tables now
-carrying `vastdb.data_endpoints` with six VIPs, principals and grants. Both
-notebooks' discovery cells run clean in the Jupyter container, each
-resolving exactly its two granted tables with the third denied 403.
-
-**Update (2026-10-01):** both notebooks re-validated top to bottom
-against the live cluster, including the Spark cells (3-11) that the
-2026-09-28 pass had only syntax-checked. All 12 cells of each run clean:
-the vended-credentials Iceberg path, the `ndb` VASTDB path, both overlaps
-(`demo.order_items` and `vastdb_demo.inventory_events` each showing the
-other principal's row), and all three expected-fail gates per notebook.
-`demo.*` tables hold rows again — the 2026-09-28 note about them reading
-empty over orphaned data is superseded by these runs.
-
-Insert idempotency re-confirmed by running `Bob.ipynb` twice: each run
-added exactly its own rows (`reviews` 10→12, `inventory_events` and
-`order_items` +1 each), so `spark.task.maxFailures=1` is still
-suppressing the bug-10 duplicate-retry path. Rows do accumulate across
-runs by design — reset the VASTDB tables if a demo needs clean counts.
-
-Three operational gotchas this pass surfaced, all written up at step 8:
-dead catalog tokens in long-open notebooks (a restart of the `polaris`
-stack kills every open session, and only a kernel restart recovers — a
-re-run of cell 3 cannot), the `PYTHONPATH` prerequisite for headless runs,
-and a false-PASS hole in the expected-fail cells — the last of these now
-fixed in both notebooks, the other two documented.
+A lab cluster rebuild invalidates the VAST side of this demo wholesale —
+users, access keys, AIM roles, identity policies, the bucket's contents, the
+VASTDB schema, and the STS TLS certificate all go at once, and which of them
+you notice first depends only on which layer you hit. **Re-probe before
+debugging**: compare the cluster's uptime and `main` VIP range against
+`polaris/.env`, then re-run `vms/provision.py` and `vms/fetch_sts_cert.sh`
+rather than chasing the 403.
 
 Directory: `~/bw/sts/` — `postgres/`, `polaris/`, `jupyter/`, each with its own
-`docker-compose.yml`. Run them in the order below. Tags: `[VMS]` = manual step
-in the VAST VMS UI/CLI, `[HOST]` = shell/docker on this host, `[NOTEBOOK]` =
-inside a Jupyter notebook cell.
+`docker-compose.yml`, plus `vms/`, which provisions and verifies the VAST side.
+Run the steps below in order. Tags: `[VMS]` = against the VMS API (scripted
+under `vms/`), `[HOST]` = shell/docker on this host, `[NOTEBOOK]` = inside a
+Jupyter notebook cell.
 
 See [README.md's "Appendix: Design rationale"](README.md#appendix-design-rationale)
 for the full design rationale (why STS AssumeRole, why Postgres, why
@@ -86,14 +35,16 @@ template to copy. Fill these in before step 1:
 | VAST S3 bucket | `whitmore` | `polaris/.env` → `VAST_BUCKET` |
 | S3 data-plane endpoint | `http://172.200.203.1` | `polaris/.env` → `VAST_S3_ENDPOINT` |
 | STS endpoint (hostname + VIP) | `https://sts.vastdata.com:443` → `172.200.203.1` | `polaris/.env` → `VAST_STS_ENDPOINT` / `VAST_STS_IP` |
-| AIM Role ARN | `arn:vast:iam::default:role/test` | `polaris/.env` → `VAST_ROLE_ARN` |
+| AIM Role ARN | `arn:vast:iam::default:role/polaris-demo` | `polaris/.env` → `VAST_ROLE_ARN` |
 | VAST DB (ndb) endpoint(s) | `172.200.203.1`–`.6` | `polaris/.env` → `VASTDB_DATA_ENDPOINTS` (step 6 copies these into each Generic Table's properties; the notebooks read them back from Polaris rather than from a file of their own) |
 | Postgres password | — | `postgres/.env.secrets` + `polaris/.env.secrets` (must match) |
 | Polaris root client secret | — | `polaris/.env.secrets` → `ROOT_CLIENT_ID`/`ROOT_CLIENT_SECRET` |
-| Admin VAST access key (var203/AllowAllTabular) | — | `polaris/.env.secrets` → `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` |
-| Alice/Bob Polaris client creds | — | `jupyter/creds/alice.env`, `bob.env` (auto-written by step 6, no template needed) |
-| Alice/Bob VASTDB keys | — | `jupyter/creds/alice_db.env`, `bob_db.env` (manual, from VMS — see step 6b) |
-| VAST STS leaf cert | — | `polaris/docker/vast-sts.pem` (fetch via `openssl s_client -connect <VAST_STS_IP>:443 -showcerts`, see step 6 bug 2) |
+| VMS admin token | — | `vms/.vms.env` → `VMS_ADDRESS`/`VMS_TOKEN` (needed only by `vms/provision.py`) |
+| STS signer key (`polaris-sts`) | — | `polaris/.env.secrets` → `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (written by step 2) |
+| VASTDB DDL key (`polaris-db-admin`) | — | `polaris/.env.secrets` → `VASTDB_ADMIN_ACCESS_KEY_ID`/`VASTDB_ADMIN_SECRET_ACCESS_KEY` (written by step 2) |
+| Alice/Bob Polaris client creds | — | `jupyter/creds/alice.env`, `bob.env` (written by step 6) |
+| Alice/Bob VASTDB keys | — | `jupyter/creds/alice_db.env`, `bob_db.env` (written by step 2) |
+| VAST STS leaf cert | — | `polaris/docker/vast-sts.pem` (fetched by `vms/fetch_sts_cert.sh`) |
 
 None of the files in the left column of the table above are committed —
 see `.gitignore`. The rest of this runbook states the real values inline
@@ -102,109 +53,112 @@ the actual source of truth and what a fresh checkout needs filled in.
 
 ## 1. `[VMS]` Confirm the whitmore view's policy flavor
 
-In VMS, confirm the View backing the `whitmore` bucket uses an **S3 Native**
-policy flavor and the S3 protocol is enabled. (STS AssumeRole and AIM roles
-require S3 Native — see kb.vastdata.com "Security Token Service (STS) and IAM
-Roles" — the VAST object type is what we're calling an **AIM Role** below.)
+STS AssumeRole and AIM Roles require the **S3 Native** policy flavor, so
+confirm the View backing the `whitmore` bucket has it and has the S3
+protocol enabled (see kb.vastdata.com "Security Token Service (STS) and IAM
+Roles"; VAST's own object type is what this runbook calls an **AIM Role**,
+to stay distinct from AWS IAM):
 
-## 2. `[VMS]` Reuse the existing "test" AIM Role — done
+```bash
+# view policy id, then its flavor
+vastpy-cli get views/ --json | jq '.[] | select(.bucket=="whitmore") | {policy_id, protocols}'
+vastpy-cli get viewpolicies/<policy_id>/ --json | jq '.[0].flavor'   # must be S3_NATIVE
+```
 
-Creating a *new* AIM Role on the default tenant failed with "Cannot create
-an IAM Role for this tenant as it has replications configured" — this
-tenant's replication config blocks new role creation (undocumented
-limitation, no known workaround found). Instead we're reusing an existing
-AIM Role already on the default tenant, named **`test`**:
+The DATABASE protocol must also be on the view for the VASTDB half of the
+demo (step 6b); `protocols` above should read `["S3","DATABASE"]`.
 
-- **Trust Policy** (already in place — the VAST-documented default, allows
-  any identity to assume it):
-  ```json
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {"Effect": "Allow", "Principal": "*", "Action": "sts:*"}
-    ]
-  }
-  ```
-- **Identity Policy** (already in place, `Sid: AllowAllTabular` — broader
-  than this demo strictly needs, `s3:*` on `Resource: ["*"]`, a superset of
-  the `GetObject`/`PutObject`/`DeleteObject`/`ListBucket`/`GetBucketLocation`
-  on `whitmore/polaris_demo/*` Polaris needs):
-  ```json
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Sid": "AllowAllTabular",
-        "Effect": "Allow",
-        "Action": ["s3:*", "dataengine:Get*", "s3:QueryEngine"],
-        "Resource": ["*"]
-      }
-    ]
-  }
-  ```
-- **Bucket owner** for `whitmore` has been changed to this `test` role
-  (`--bucket-owner-type ROLE`), matching VAST's documented pattern for
-  STS-vended access. Note this is a change to a bucket also used outside
-  this demo — accepted deliberately, not something to redo casually.
+## 2. `[VMS]` Provision the VAST identities
 
-**Security note:** because the Trust Policy is wide-open (`Principal: "*"`)
-and the Identity Policy is `s3:*` on `*`, this role provides **no isolation
-at the storage layer** — anyone who can reach the STS endpoint can assume it
-and touch any bucket. Alice/Bob isolation in this demo comes entirely from
-Polaris's own per-table grants (see `polaris/config/setup.sh`), not from
-this role. Don't reuse `test` for anything where storage-layer isolation
-actually matters.
+```bash
+cd ~/bw/sts
+cp vms/.vms.env.example vms/.vms.env   # fill in VMS_ADDRESS + VMS_TOKEN, chmod 600
+./vms/provision.py --dry-run           # report what would change
+./vms/provision.py
+```
 
-Role ARN — VAST supports two formats: the newer 5-field
-`arn:vast::<tenant>:role/test` and the older 6-field
-`arn:vast:iam::<tenant>:role/test` (added pre-5.4.6, kept for backward
-compatibility). **Use the 6-field form everywhere in this demo** —
-`polaris/.env`'s `VAST_ROLE_ARN` is already set to
-`arn:vast:iam::default:role/test` — because Apache Polaris 1.7.0 hardcodes a
-6-field ARN regex and rejects the 5-field form with `Invalid role ARN
-format` (apache/polaris#5099, open/unresolved upstream). Step 3b below
-confirms VAST itself still accepts the 6-field form directly, independent
-of Polaris.
+`vms/provision.py` is idempotent and creates four VAST identities, each
+holding only what its one job needs:
+
+| Identity | Kind | May do |
+|---|---|---|
+| `polaris-sts` | User | Nothing but `sts:AssumeRole` — it has **no** identity policy at all. Its permanent key is what Polaris signs `AssumeRole` with, written to `polaris/.env.secrets`. |
+| `polaris-demo` | AIM Role | Object read/write under `whitmore/polaris_demo/*` plus `ListBucket`/`GetBucketLocation` on the bucket, via identity policy `polaris-sts-demo`. This is what Polaris vends. |
+| `polaris-db-admin` | User | Tabular DDL over `whitmore/polaris_demo_db` only. The `vastdb-setup` sidecar runs as this to create the schema and its three tables. |
+| `alice-db`, `bob-db` | Users | Read/write on their own VASTDB tables and the shared `inventory_events`, nothing else. Keys written to `jupyter/creds/{alice,bob}_db.env`. |
+
+The split matters: a leak of the signer's key vends nothing by itself, and
+the role it assumes cannot reach the rest of the bucket. Verify both halves
+of that claim in step 3 before configuring Polaris.
+
+Four things about the VMS API this script exists to encode:
+
+1. **The role's identity-policy attachment writes as `s3_policies` and reads
+   back as `s3_policies_ids`.** Sending `s3_policies_ids` on `POST` or
+   `PATCH iamroles/` is accepted with a 200 and silently ignored, leaving a
+   role with no identity policy — which fails later, as an `AccessDenied` on
+   every S3 call made with the vended credentials, nowhere near the cause.
+   Check `s3_policies_ids` on a `GET` after creating a role.
+2. **Identity-policy `Resource` entries are bare bucket and prefix strings**
+   (`whitmore/polaris_demo/*`), not full ARNs.
+3. **`s3:TabularCreateSchema` is checked against the schema being created**,
+   not against the bucket — the 403 names `@s3_object_name=<schema>`. It
+   belongs on a statement whose `Resource` is `bucket/schema`. The same shape
+   applies to `s3:TabularListTables` (step 6b).
+4. **The Trust Policy can name the principal**:
+   `{"Principal": {"User": ["polaris-sts"]}, "Action": "sts:AssumeRole"}` is
+   enough, and the assuming user needs no identity policy of its own. VAST's
+   documented example uses `Principal: "*"`, which is far broader than this
+   demo needs.
+
+Two things the VMS UI would also have you do, which are **not** required:
+changing the bucket owner to the role (`--bucket-owner-type ROLE`) — the
+vended credentials work against a bucket still owned by a user, and leaving
+it alone avoids disturbing other work on a shared bucket — and granting the
+role `s3:*` on `*`.
+
+Then refresh the STS certificate, which a cluster rebuild replaces:
+
+```bash
+./vms/fetch_sts_cert.sh
+```
+
+Polaris's Java AWS SDK validates the chain itself, so this cert is baked
+into the image's JVM truststore with `keytool` (`polaris/docker/Dockerfile`)
+— `update-ca-trust extract` silently drops it, since it is not a CA cert.
+The hostname in `VAST_STS_ENDPOINT` has to match one of the cert's SAN
+entries; see the README on why that is a made-up `sts.vastdata.com`.
 
 ## 3. `[HOST]` Pass/fail: raw AssumeRole + S3 check
 
-Before touching Polaris, prove the role works standalone:
-
-STS specifically requires **HTTPS on port 443** (self-signed cert on this
-lab cluster, hence `--no-verify-ssl`) — plain `http://` on port 80 (which
-works fine for ordinary S3 calls) gets rejected for `AssumeRole` with a
-generic `AccessDenied`, per VAST's own documented example:
+Prove the role works standalone before touching Polaris — there is no value
+in debugging Polaris storage config against a broken AIM Role:
 
 ```bash
-aws sts assume-role \
-  --role-arn "arn:vast::default:role/test" \
-  --role-session-name sts-demo-test \
-  --endpoint-url https://172.200.203.1:443 \
-  --no-verify-ssl \
-  --profile var203
+./vms/verify_sts.sh
 ```
 
-**3b.** Confirmed passing above with the 5-field ARN. Since Polaris will
-actually be sent the 6-field form, also confirm VAST accepts *that* form
-before retrying step 6 — swap in `arn:vast:iam::default:role/test` and
-re-run the same two commands (assume-role, then `s3 ls` with the returned
-temp creds). If this fails, the 6-field legacy format may not actually be
-enabled on this cluster and we're back to an unresolved Polaris/VAST
-incompatibility.
+It assumes the role with the signer key, then with the returned temporary
+credentials lists, puts, gets and deletes under `whitmore/polaris_demo/`,
+and checks that the same credentials are **refused** outside that prefix.
+All six lines must read `PASS`.
 
-Take the returned `AccessKeyId`/`SecretAccessKey`/`SessionToken` and:
+STS requires **HTTPS on port 443** here: plain `http://` on port 80, which
+is fine for ordinary S3 calls, is rejected for `AssumeRole` with a generic
+`AccessDenied` however the policies read. The cert is self-signed, hence
+`--no-verify-ssl` on the CLI path.
 
-```bash
-AWS_ACCESS_KEY_ID=<from above> \
-AWS_SECRET_ACCESS_KEY=<from above> \
-AWS_SESSION_TOKEN=<from above> \
-aws s3 ls s3://whitmore/polaris_demo/ --endpoint-url https://172.200.203.1:443 --no-verify-ssl
-```
+VAST accepts both the newer 5-field ARN (`arn:vast::<tenant>:role/<name>`)
+and the older 6-field form (`arn:vast:iam::<tenant>:role/<name>`).
+**Use the 6-field form everywhere**, as `polaris/.env` does: Apache Polaris
+1.7.0 hardcodes a 6-field ARN regex and rejects the 5-field VAST form with
+`Invalid role ARN format` (apache/polaris#5099, open upstream).
 
-**PASS** = the `s3 ls` succeeds (empty listing is fine, the prefix doesn't
-exist yet). **FAIL** = double-check the tenant name in the role ARN, and
-that `whitmore`'s owner really is the `test` role, before proceeding — do
-not debug Polaris against a broken role.
+If `AssumeRole` itself fails, check that the signer user named in
+`polaris/.env.secrets` is the one the role's Trust Policy names, and that
+the role exists on the tenant in the ARN. If `AssumeRole` passes but the S3
+calls do not, the role almost certainly has no identity policy attached —
+see point 1 in step 2.
 
 ## 4. `[HOST]` Create the shared docker network
 
@@ -228,11 +182,9 @@ docker compose exec postgres pg_isready -U polaris -d polaris
 
 ## 6. `[HOST]` Start Polaris (bootstrap → server → catalog/principal setup)
 
-Fill in `VAST_ROLE_ARN` in `polaris/.env` (from step 2) if you haven't
-already, then:
-
 ```bash
 cd ~/bw/sts/polaris
+docker compose build polaris vastdb-setup   # picks up a refreshed STS cert
 docker compose up
 ```
 
@@ -254,11 +206,13 @@ the files now, documented here so we don't lose why):
    insert/select into pre-existing tables, they don't create them.
 2. **Polaris's Java AWS SDK client needs to actually trust and hostname-
    verify VAST's STS cert**, not just have the CLI's `--no-verify-ssl`
-   available. `polaris/docker/Dockerfile` now builds a custom Polaris image
-   that imports VAST's STS cert (`polaris/docker/vast-sts.pem`, fetched via
-   `openssl s_client -connect 172.200.203.1:443 -showcerts`) into the JVM
-   truststore with `keytool` — `update-ca-trust extract` silently drops it
-   since it's not a CA cert, so that path doesn't work. Separately, the
+   available. `polaris/docker/Dockerfile` builds a custom Polaris image
+   that imports VAST's STS cert (`polaris/docker/vast-sts.pem`, refreshed by
+   `vms/fetch_sts_cert.sh`) into the JVM truststore with `keytool` —
+   `update-ca-trust extract` silently drops it since it's not a CA cert, so
+   that path doesn't work. **The cert is per cluster build**, so a rebuilt
+   cluster serves a different one and every Polaris STS call fails chain
+   validation until the pem is re-fetched and the image rebuilt. Separately, the
    cert's SAN doesn't cover the raw VIP, only `*.vastdata.com` and other
    IPs — `polaris/docker-compose.yml` adds an `extra_hosts` entry mapping a
    made-up `sts.vastdata.com` (matches the wildcard SAN) to the real VIP,
@@ -394,91 +348,64 @@ attempt that follows is VAST enforcing the Identity Policy. The identifier
 for that write has to be built by hand, since `ndb()` can only produce
 identifiers for tables Polaris was willing to describe.
 
-**`[VMS]` Create two new VAST Users with scoped Identity Policies:**
+**The two scoped VASTDB identities** (`alice-db`, `bob-db`) are created by
+`vms/provision.py` in step 2, along with their identity policies and access
+keys. Each gets read/write on its own table plus the shared
+`inventory_events`, and nothing else:
 
-Create `alice-db` and `bob-db` (User Management > Users > Create User,
-then generate an Access Key for each — this is a plain User/Access-Key
-object, not an AIM Role, so it isn't subject to the tenant-replication
-block from step 2). Attach an Identity Policy to each:
+| | `shipments` | `reviews` | `inventory_events` |
+|---|---|---|---|
+| `alice-db` | allow | — | allow |
+| `bob-db` | — | allow | allow |
 
-**alice-db** — access to `shipments` (hers) and `inventory_events` (the
-deliberate overlap with Bob):
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["whitmore"]},
-    {"Effect": "Allow", "Action": ["s3:TabularListSchemas"], "Resource": ["whitmore"]},
-    {"Effect": "Allow", "Action": ["s3:TabularListTables", "s3:TabularBeginTransaction", "s3:TabularCommitTransaction", "s3:TabularRollbackTransaction", "s3:TabularGetTransaction"], "Resource": ["whitmore/polaris_demo_db", "whitmore/polaris_demo_db/*"]},
-    {"Effect": "Allow", "Action": ["s3:TabularQueryData", "s3:TabularInsertRows", "s3:TabularUpdateRows", "s3:TabularGetTableStats", "s3:TabularListColumns"], "Resource": ["whitmore/polaris_demo_db/shipments", "whitmore/polaris_demo_db/inventory_events"]}
-  ]
-}
+Verify the grants against the raw `vastdb` SDK before involving Spark:
+
+```bash
+.bw/bin/python vms/verify_vastdb.py
 ```
 
-**bob-db** — same shape, access to `reviews` (his) and `inventory_events`:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["whitmore"]},
-    {"Effect": "Allow", "Action": ["s3:TabularListSchemas"], "Resource": ["whitmore"]},
-    {"Effect": "Allow", "Action": ["s3:TabularListTables", "s3:TabularBeginTransaction", "s3:TabularCommitTransaction", "s3:TabularRollbackTransaction", "s3:TabularGetTransaction"], "Resource": ["whitmore/polaris_demo_db", "whitmore/polaris_demo_db/*"]},
-    {"Effect": "Allow", "Action": ["s3:TabularQueryData", "s3:TabularInsertRows", "s3:TabularUpdateRows", "s3:TabularGetTableStats", "s3:TabularListColumns"], "Resource": ["whitmore/polaris_demo_db/reviews", "whitmore/polaris_demo_db/inventory_events"]}
-  ]
-}
-```
+Each principal must load, select and insert on its two tables and be
+refused on the third. The inserts are real rows, as the notebooks' are —
+reset the VASTDB tables if a demo needs clean counts.
 
 Action names and the `bucket/schema/table` resource format are from VAST's
-"Managing permissions for accessing VAST tabular databases" KB doc —
-table-level scoping (not just schema-level) is explicitly supported, which
+"Managing permissions for accessing VAST tabular databases" KB doc.
+Table-level scoping (not just schema-level) is explicitly supported, which
 is what makes the same overlap pattern as the Iceberg side possible here.
 
-**Three bugs found and fixed getting past the 403s, all isolated with the
-`vastdb` Python SDK directly against VAST — no Spark involved at all,
-much faster iteration than rebuilding notebooks each time:**
-1. The policy originally had *only* `s3:Tabular*` actions, no plain S3
-   action. A raw `aws s3api head-bucket --bucket whitmore` with alice-db's
-   key 403'd identically to the Tabular calls, proving the gap wasn't
-   Tabular-specific: VAST's `HeadBucket`/tabular-session-open path needs
-   plain `s3:ListBucket` on the bucket first (AWS's own docs say the same
-   about `HeadBucket`). Added above. **Confirmed fixed live.**
-2. After that fix, bucket access and `TabularListSchemas` worked, but
-   `TabularListTables` still 403'd — the error body named the denied
-   object as `polaris_demo_db` with **no trailing wildcard**
-   (`@s3_object_name=polaris_demo_db`), revealing that "list tables in
-   schema X" checks permission on the schema object **itself**, not a
-   `schema/*` "children of" pattern (the shape the docs' example implied
-   was sufficient). Fixed by granting both
-   `whitmore/polaris_demo_db` (the schema itself) *and*
-   `whitmore/polaris_demo_db/*` (tables inside it) on that statement.
-   **Confirmed fixed live** — `tables()` listing now succeeds for both
-   alice-db and bob-db.
-3. After that, listing tables worked but *loading a specific table*
-   (`schema.table(name)`, which the SDK calls internally before any
-   select/insert) still 403'd on a `GET .../shipments?stats` call — a
-   distinct action, `s3:TabularGetTableStats`, that the table-scoped
-   statement never granted (it only had `TabularQueryData`/
-   `InsertRows`/`UpdateRows`). Added above. **Confirmed fixed live** —
-   the `?stats` call now passes for granted tables.
-4. Past `?stats`, table loading hit one more distinct check: `GET
-   .../shipments?column` (fetching the table's column/schema list) —
-   `s3:TabularListColumns`, a 4th action never granted. Added above.
-   **Confirmed fixed live — this closes out the VASTDB grant chain.**
-   `select().read_all()` now succeeds end-to-end for both alice-db and
-   bob-db on their own tables and the shared `inventory_events`, and the
-   cross-access checks (alice→reviews, bob→shipments) both correctly
-   403 with a clean early rejection (no permissions granted there at
-   all, so it fails at the first check rather than a deep one).
+Four actions these policies need that the KB's example policy does not
+show, each found as a separate 403 and each isolated against the `vastdb`
+SDK directly rather than by rebuilding a notebook:
 
-Pattern worth noting: merely *loading* a table object (before any actual
-read/write) chains through `TabularGetTableStats` and
-`TabularListColumns` as separate checks beyond `TabularQueryData` — the
-docs' example policy didn't make this obvious; only live testing surfaced
-it, one 403 at a time.
+1. **Plain `s3:ListBucket` on the bucket.** With only `s3:Tabular*`
+   actions, a raw `aws s3api head-bucket` 403s identically to the Tabular
+   calls — the gap is not Tabular-specific: VAST's
+   `HeadBucket`/tabular-session-open path needs `s3:ListBucket` first.
+2. **The schema object itself as a `Resource`.** "List tables in schema X"
+   checks permission on the schema object, not on a `schema/*` "children
+   of" pattern — the 403 names `@s3_object_name=polaris_demo_db` with no
+   trailing wildcard. Grant both `whitmore/polaris_demo_db` and
+   `whitmore/polaris_demo_db/*`.
+3. **`s3:TabularGetTableStats`.** Loading a table object — which the SDK
+   does internally before any select or insert — issues
+   `GET .../<table>?stats`, a distinct check the table-scoped statement
+   would otherwise not grant.
+4. **`s3:TabularListColumns`.** Past `?stats`, loading hits
+   `GET .../<table>?column` for the table's schema, a fourth action.
 
-`[HOST]` Put the resulting access key/secret pairs into
-`jupyter/creds/alice_db.env` and `jupyter/creds/bob_db.env` (replacing
-`CHANGE_ME`).
+The pattern worth carrying forward: merely *loading* a table chains through
+`TabularGetTableStats` and `TabularListColumns` as separate checks before
+`TabularQueryData` is ever reached.
+
+**A table-scoped principal cannot list the whole schema.** `schema.tables()`
+in `vastdb` 2.0.14.1 eagerly loads per-table stats while listing, so it
+raises `Forbidden` on the first table the principal has no grant on —
+table-scoped grants and a bare schema listing are mutually exclusive in
+this SDK. Nothing in the demo needs it: the notebooks discover tables
+through Polaris's Generic Tables API and address them by name, and
+`vms/verify_vastdb.py` does the same. Only `polaris-db-admin`, which holds
+schema-wide DDL, can list.
+
 
 ## 7. `[HOST]` Start Jupyter
 
@@ -554,6 +481,27 @@ correctly end-to-end, including the VASTDB cells.
     to succeed. Confirmed live on both failure modes. Fix: both
     notebooks' `SparkSession.builder` now set
     `.config('spark.task.maxFailures', '1')`.
+11. **The VAST connector logs ERROR stack traces for tables that are not
+    its own.** Its Spark parser extension and resolution rule
+    (`ndb.NDBParser`, `ndb.view.NDBTablesResolutionRule`) probe every
+    relation Spark resolves, so each Iceberg `demo.*` query emits
+    `could not find DataSource for provider: demo` and
+    `Failed to resolve UnresolvedRelation as a RCLS-enabled table`,
+    with full stack traces, before falling through correctly. The
+    connector also requests row/column-level security metadata on every
+    VASTDB table access, which a cluster without RCLS configured answers
+    with a 500 — another WARN and stack trace per query, via
+    `spark.sql.catalog.ndb.VastCatalogUtils`. All of it is noise, and
+    enough of it that a working demo reads as broken. Fix: those three
+    loggers are set to `off` in `jupyter/docker/log4j2.properties`.
+    Measured on a full `Alice.ipynb` run: the executed notebook went from
+    183 KB to 39 KB and from several hundred stack frames to one, with all
+    three expected-fail gates still passing.
+    `com.vastdata.client.VastClient` is deliberately left alone — it
+    carries the genuine 403 that explains the VASTDB expected-fail cells.
+    Its remaining one-liners (a 500 for the row-column-security probe, a
+    400 for `LIST_SORTED_BY` on a cluster without Elysium) are expected
+    here and are not failures.
 
 **Pass/fail:** `curl --fail http://localhost:8888` (token is `sts-demo`, see
 `jupyter/docker-compose.yml`).
@@ -713,26 +661,35 @@ cd ~/bw/sts/postgres && docker compose down   # add -v to also drop the Postgres
 docker network rm sts_net
 ```
 
-## Known open items (from planning — revisit as we iterate)
+## Known open items
 
-- VMS UI field names in step 2 are from VAST KB docs; adjust to match this
-  cluster's actual VMS version if labels differ.
 - `polaris-setup` writes credentials directly into `../jupyter/creds/` via a
-  bind mount across compose projects — if that turns out to be fragile
-  (e.g. permissions), fall back to copying the clientId/secret it prints to
-  stdout by hand.
+  bind mount across compose projects — if that turns out to be fragile,
+  fall back to copying the clientId/secret it prints to stdout by hand.
+- **Credential files the Jupyter container reads are group-readable, not
+  0600.** The image runs as `jovyan` (uid 1000, gid 100 `users`) while the
+  host account is uid 1001, so a 0600 file written on the host is simply
+  unreadable inside the container and the notebook fails on a missing key.
+  `vms/provision.py` writes `jupyter/creds/*_db.env` as `0640` group
+  `users`, which the host account is also a member of. Secrets only Polaris
+  reads (`polaris/.env.secrets`) stay 0600 — that stack's containers run as
+  root.
 - Polaris's `storageConfigInfo.endpoint`/`stsEndpoint` currently point at a
   single VAST VIP (`172.200.203.1`). If that VIP becomes a bottleneck or
   goes down, we may need a small internal load-balancer (e.g. nginx stream
   proxy) across all six VIPs, similar to how Trino's `data_endpoints` spreads
   across them.
-- ~~TLS trust/hostname risk for step 6~~ — hit and fixed, see step 6's
-  numbered writeup above (custom truststore + `extra_hosts` wildcard-SAN
-  workaround).
-- `polaris/docker/vast-sts.pem` has a fixed expiry (2036, checked at fetch
-  time) — if VAST ever rotates this cert, `docker compose build polaris`
-  needs to be rerun after re-fetching it via the `openssl s_client` command
-  in step 6's writeup above.
+- **A Jupyter rebuild is slow and not free.** Its base image is pinned
+  (`scipy-notebook:python-3.13.16`) precisely because re-resolving `:latest`
+  invalidates every layer below it: a one-line change to
+  `log4j2.properties` re-downloads the base, Spark and the connector, took
+  over an hour here, and moved Python from 3.13.15 to 3.13.16 underneath a
+  demo that was working. Bump the pin deliberately, and re-run both
+  notebooks afterwards.
+- `polaris/docker/vast-sts.pem` is baked into the Polaris image, so it has
+  to be re-fetched (`vms/fetch_sts_cert.sh`) and the image rebuilt whenever
+  VAST serves a different one — which a cluster rebuild always does, and a
+  cert rotation would too.
 - All three long-lived services set `restart: unless-stopped`, so anything
   that bounces the docker daemon brings them all back. **Expect noisy
   Polaris logs for the first few seconds after such a restart:** restart

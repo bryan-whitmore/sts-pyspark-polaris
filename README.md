@@ -30,8 +30,13 @@ steps they affect.
 | `polaris/` | Polaris 1.7.0 server, plus three one-shot sidecars: schema bootstrap, VASTDB table creation, catalog/principal/grant setup | [polaris/docker-compose.yml](polaris/docker-compose.yml) |
 | `jupyter/` | Jupyter + a hand-installed Spark 3.5.3 (Scala 2.13) with the Iceberg and VAST DB connector jars | [jupyter/docker-compose.yml](jupyter/docker-compose.yml) |
 
-All three attach to one external docker network, `sts_net`, so the containers
-resolve each other by name. Bring them up in the order above; ports are
+`vms/` is not a stack: it holds the scripts that provision and verify the
+VAST side — `provision.py` (identities, AIM role, identity policies, access
+keys), `verify_sts.sh` and `verify_vastdb.py` (the pass/fail gates for each
+half), and `fetch_sts_cert.sh` (the STS leaf cert the Polaris image trusts).
+
+All three stacks attach to one external docker network, `sts_net`, so the
+containers resolve each other by name. Bring them up in the order above; ports are
 `5432` (Postgres), `8181`/`8182`/`5005` (Polaris REST+management / health /
 JVM debug), `8888` (Jupyter, token `sts-demo`), `4040`–`4041` (Spark UIs).
 
@@ -44,11 +49,12 @@ in per [runbook.md § 0 Prerequisites](runbook.md#0-prerequisites--cluster-speci
 | Fill in | From template | Holds |
 |---|---|---|
 | `polaris/.env` | [polaris/.env.example](polaris/.env.example) | Bucket, prefix, S3 + STS endpoints, STS VIP, role ARN, catalog/realm names |
-| `polaris/.env.secrets` | [polaris/.env.secrets.example](polaris/.env.secrets.example) | Postgres password, Polaris root client secret, the permanent VAST key that signs `AssumeRole` |
+| `polaris/.env.secrets` | [polaris/.env.secrets.example](polaris/.env.secrets.example) | Postgres password, Polaris root client secret, the `polaris-sts` key that signs `AssumeRole`, the `polaris-db-admin` key the VASTDB DDL sidecar uses |
+| `vms/.vms.env` | [vms/.vms.env.example](vms/.vms.env.example) | VMS address + admin token, read only by `vms/provision.py` |
 | `postgres/.env.secrets` | [postgres/.env.secrets.example](postgres/.env.secrets.example) | Same Postgres credentials, for the DB side |
 | `polaris/.env` → `VASTDB_DATA_ENDPOINTS` | [polaris/.env.example](polaris/.env.example) | CNode VIP list; `setup.sh` copies it into each Generic Table, and the notebooks read it back from the catalog |
-| `jupyter/creds/{alice,bob}_db.env` | [alice_db.env.example](jupyter/creds/alice_db.env.example), [bob_db.env.example](jupyter/creds/bob_db.env.example) | Per-principal, narrowly scoped VASTDB access keys created by hand in VMS |
-| `polaris/docker/vast-sts.pem` | — (fetch with `openssl s_client`, see [runbook.md § 6](runbook.md#6-host-start-polaris-bootstrap--server--catalogprincipal-setup)) | VAST's STS leaf cert, baked into the Polaris image's Java truststore |
+| `jupyter/creds/{alice,bob}_db.env` | [alice_db.env.example](jupyter/creds/alice_db.env.example), [bob_db.env.example](jupyter/creds/bob_db.env.example) | Per-principal, table-scoped VASTDB access keys (written by `vms/provision.py`) |
+| `polaris/docker/vast-sts.pem` | — (run [vms/fetch_sts_cert.sh](vms/fetch_sts_cert.sh)) | VAST's STS leaf cert, baked into the Polaris image's Java truststore |
 
 `jupyter/creds/{alice,bob}.env` are not templates to fill in — the
 `polaris-setup` sidecar writes each principal's Polaris client ID, secret,
@@ -63,10 +69,12 @@ The rest is tracked and should not need editing per cluster:
 | [polaris/config/setup.sh](polaris/config/setup.sh) | Creates the catalog's STS storage config, the `demo` and `vastdb_demo` namespaces and tables, both principals, and all table-scoped grants |
 | [polaris/config/application.properties](polaris/config/application.properties) | Quarkus overrides: `relational-jdbc` persistence pointed at Postgres |
 | [polaris/docker/Dockerfile](polaris/docker/Dockerfile) | Imports the VAST STS cert into the JVM `cacerts` with `keytool` |
-| [polaris/config/vastdb_setup/setup_vastdb.py](polaris/config/vastdb_setup/setup_vastdb.py) | Creates the VASTDB schema and its three tables |
+| [polaris/config/vastdb_setup/setup_vastdb.py](polaris/config/vastdb_setup/setup_vastdb.py) | Creates the VASTDB schema and its three tables, as `polaris-db-admin` |
+| [vms/provision.py](vms/provision.py) | Creates every VAST-side identity, policy, role and access key, idempotently |
+| [vms/verify_sts.sh](vms/verify_sts.sh), [vms/verify_vastdb.py](vms/verify_vastdb.py) | Pass/fail gates for the STS and VASTDB halves, before Polaris or Spark is involved |
 | [jupyter/docker/Dockerfile](jupyter/docker/Dockerfile) | Spark 3.5.3 / Scala 2.13, Iceberg 1.10.1, VAST DB connector, minus three conflicting bundled jars |
 | [jupyter/docker/spark-defaults.conf](jupyter/docker/spark-defaults.conf) | `extraClassPath` for the connector — must be static, read before JVM launch |
-| [jupyter/docker/log4j2.properties](jupyter/docker/log4j2.properties) | Spark root logger at `warn` instead of `info` |
+| [jupyter/docker/log4j2.properties](jupyter/docker/log4j2.properties) | Spark root logger at `warn`, and the VAST connector's relation-probe loggers off |
 | [postgres/config/postgresql.conf](postgres/config/postgresql.conf) | Raised `max_connections` |
 
 ## Identities and grants
@@ -98,6 +106,29 @@ permanent identity allowed to call `sts:AssumeRole`, and an **Identity Policy**
 listing what the assumed role may do. Identity-policy `Resource` entries are
 bare bucket and prefix strings (`whitmore/polaris_demo/*`), not full ARNs, and
 the View backing the bucket must use the **S3 Native** policy flavor.
+
+Four VAST identities carry this, each holding only what its own job needs, so
+that no single leaked credential reproduces the demo's reach:
+
+| Identity | May do |
+|---|---|
+| `polaris-sts` (User) | Nothing but assume the role — it has no identity policy at all. Its permanent key is the one Polaris signs `AssumeRole` with. |
+| `polaris-demo` (AIM Role) | Object read/write under `whitmore/polaris_demo/*`, plus bucket-level `ListBucket`/`GetBucketLocation`. This is what Polaris vends. |
+| `polaris-db-admin` (User) | Tabular DDL over the `polaris_demo_db` schema only, for the one-shot table-creation sidecar. |
+| `alice-db`, `bob-db` (Users) | Read/write on their own VASTDB tables and the shared `inventory_events`. |
+
+The split is what makes the vended credential meaningful: the signer's key
+vends nothing on its own, and the role it assumes is refused everywhere
+outside the demo prefix — [vms/verify_sts.sh](vms/verify_sts.sh) asserts both
+directions. So isolation here holds at the storage layer *and* at the Polaris
+grant layer, independently.
+
+A Trust Policy can name its principal (`{"Principal": {"User":
+["polaris-sts"]}}`); the `Principal: "*"` in VAST's documented example is far
+broader than any of this needs, and the assuming user needs no identity policy
+of its own. The bucket owner does **not** have to be the role — the vended
+credentials work against a bucket still owned by a user, which matters on a
+bucket shared with other work.
 
 Two shapes of that ARN exist on VAST. Polaris 1.7.0 hardcodes a six-field
 regex (`arn:vast:iam::<tenant>:role/<name>`) and rejects the five-field form
@@ -194,12 +225,19 @@ gated by that principal's `TABLE_FULL_METADATA` grant and returns the
 `vastdb.*` properties needed to address the table through `ndb`; listing is
 catalog-wide and leaks names only.
 
-The consequence is that Alice and Bob each need their own narrowly scoped VASTDB
-access key, created by hand in VMS, with an Identity Policy that goes beyond the
-documented example — plain `s3:ListBucket`, the schema-object-itself resource
-form, `TabularGetTableStats` and `TabularListColumns` all turned out to be
-required. Testing those against the raw `vastdb` SDK is far faster than
-rebuilding a notebook per attempt.
+The consequence is that Alice and Bob each need their own table-scoped VASTDB
+access key, with an Identity Policy that goes beyond the documented example:
+plain `s3:ListBucket`, the schema object itself as a `Resource`,
+`TabularGetTableStats` and `TabularListColumns` are all required, because
+merely *loading* a table chains through several separate permission checks
+before `TabularQueryData` is reached. Test a policy against the raw `vastdb`
+SDK — [vms/verify_vastdb.py](vms/verify_vastdb.py) — rather than through a
+notebook: one 403 at a time is much faster to read with no Spark in the way.
+
+Table-scoped grants and a whole-schema listing are mutually exclusive in
+`vastdb` 2.0.14.1, which eagerly loads per-table stats while listing and so
+403s on the first table the principal cannot read. Nothing here needs that
+listing: discovery goes through Polaris and tables are addressed by name.
 
 ### Why credentials are written, not copied by hand
 
@@ -212,6 +250,7 @@ that proves fragile, the same values are printed to the sidecar's stdout.
 
 `endpoint` and `stsEndpoint` both point at one VAST VIP, because Polaris takes a
 single endpoint string where the VAST DB connector and Trino accept an endpoint
-list. For a demo that is fine. Spreading load across all six CNode VIPs would
-need a small internal load balancer — an nginx stream proxy, say — in front of
-Polaris's S3 and STS endpoints.
+list. For a demo that is fine. In production, spreading load across all CNode
+VIPs should use a hostname + DNS for Polaris's S3 and STS endpoints (either
+delegating to the DNS server built into the VAST cluster, or a reputable DNS
+load balancer).

@@ -1,4 +1,8 @@
-FROM quay.io/jupyter/scipy-notebook:latest
+# Pinned, not :latest. This image installs Spark and the VAST connector into
+# the base, so re-resolving the tag invalidates every layer below and can move
+# the Python/Scala environment underneath a demo that was working. This tag is
+# the one the demo is validated against.
+FROM quay.io/jupyter/scipy-notebook:python-3.13.16
 
 USER root
 

@@ -13,3 +13,6 @@ polaris/docker/vast-sts.pem
 # Generated/manual per-principal Polaris + VASTDB credentials and the
 # shared VASTDB endpoint list.
 jupyter/creds/*.env
+
+# VMS admin credentials for vms/provision.py.
+vms/.vms.env
